@@ -1,0 +1,79 @@
+# Reusable: deploy one environment, smoke-test it, and check the version landed.
+name: deploy-env
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-${{ inputs.env }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Init (this env's state key)
+        run: |
+          terraform init -input=false -no-color -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=voting-app/${{ inputs.env }}/terraform.tfstate" \
+            -backend-config="region=eu-north-1" \
+            -backend-config="use_lockfile=true"
+
+      - name: Apply
+        run: |
+          terraform apply -input=false -no-color -auto-approve \
+            -var-file=envs/${{ inputs.env }}.tfvars \
+            -var="name_prefix=${{ vars.NAME_PREFIX }}" \
+            -var="image_tag=${{ inputs.image_tag }}"
+
+      - name: Smoke test (P9)
+        run: |
+          VOTE=$(terraform output -raw vote_url)
+          RESULT=$(terraform output -raw result_url)
+          echo "vote:   $VOTE"
+          echo "result: $RESULT"
+          curl --fail --retry 10 --retry-delay 6 --retry-all-errors -s -o /dev/null "$VOTE/healthz"
+          curl --fail --retry 10 --retry-delay 6 --retry-all-errors -s -o /dev/null "$RESULT/healthz"
+          echo "both /healthz returned 200"
+
+      - name: Version check (P10)
+        run: |
+          set +e
+          terraform plan -input=false -no-color -detailed-exitcode \
+            -var-file=envs/${{ inputs.env }}.tfvars \
+            -var="name_prefix=${{ vars.NAME_PREFIX }}" \
+            -var="image_tag=${{ inputs.image_tag }}"
+          code=$?
+          echo "plan exit code: $code"
+          if [ "$code" = "2" ]; then
+            echo "::error::Deployment did not stick (ECS likely rolled back)."
+            exit 1
+          fi
+          exit $code

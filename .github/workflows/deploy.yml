@@ -1,1 +1,115 @@
-# The pipeline (contracts P1-P11). Fill it in. Until it has on: and jobs:, GitHub shows it as an invalid workflow
+name: deploy
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["services/**", "infra/**", ".github/workflows/**"]
+  push:
+    branches: [main]
+    paths: ["services/**", "infra/**", ".github/workflows/**"]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: fmt
+        run: terraform fmt -check -recursive -no-color
+      - name: validate
+        working-directory: infra
+        run: |
+          terraform init -input=false -no-color -backend=false
+          terraform validate -no-color
+
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [vote, result, worker]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (and push only on main)
+        env:
+          REG: ${{ steps.ecr.outputs.registry }}
+          REPO: ${{ vars.NAME_PREFIX }}-${{ matrix.service }}
+          TAG: ${{ github.sha }}
+        run: |
+          IMAGE="$REG/$REPO:$TAG"
+          PUSH=false
+          if [ "${{ github.event_name }}" = "push" ]; then PUSH=true; fi
+          if [ "$PUSH" = "true" ] && aws ecr describe-images \
+                --repository-name "$REPO" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "$IMAGE already exists — skipping push."
+            PUSH=false
+          fi
+          docker buildx build \
+            --platform linux/amd64 \
+            --push=$PUSH \
+            -t "$IMAGE" \
+            services/${{ matrix.service }}
+
+  plan:
+    needs: build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, prod]
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Init (${{ matrix.env }} state key)
+        run: |
+          terraform init -input=false -no-color -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=voting-app/${{ matrix.env }}/terraform.tfstate" \
+            -backend-config="region=eu-north-1" \
+            -backend-config="use_lockfile=true"
+      - name: Plan ${{ matrix.env }}
+        run: |
+          terraform plan -input=false -no-color \
+            -var-file=envs/${{ matrix.env }}.tfvars \
+            -var="name_prefix=${{ vars.NAME_PREFIX }}" \
+            -var="image_tag=${{ github.sha }}"
+
+  deploy-dev:
+    needs: build
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      env: dev
+      image_tag: ${{ github.sha }}
+    secrets: inherit
+
+  deploy-prod:
+    needs: deploy-dev
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      env: prod
+      image_tag: ${{ github.sha }}
+    secrets: inherit
